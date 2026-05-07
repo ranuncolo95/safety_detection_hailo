@@ -1,0 +1,1 @@
+python3 inferenza.py   --hef ./models/yolov8m_seg.hef   --video ./video_inferenza/video_2.mp4  --person-score-thr 0.70   --topk-per-scale 120   --display
