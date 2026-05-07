@@ -34,8 +34,11 @@ SCORE_THR = 0.45
 NMS_THR = 0.50
 MASK_THR = 0.50
 
-DANGER_W_FRAC = 0.60
-DANGER_H_FRAC = 0.55
+DANGER_W_FRAC = 0.40
+DANGER_H_FRAC = 0.35
+
+WARNING_MARGIN_FRAC = 0.20
+FEET_MASK_FRAC = 0.20
 
 MIN_BOX_AREA_FRAC = 0.001
 MAX_BOX_AREA_FRAC = 0.45
@@ -47,6 +50,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Hailo YOLOv8 segmentation inference con danger zone"
     )
+
     p.add_argument("--hef", default=DEFAULT_HEF, help="Path del file HEF")
     p.add_argument("--video", default=DEFAULT_VIDEO, help="Path del video input")
     p.add_argument("--output", default=DEFAULT_OUTPUT, help="Path del video output")
@@ -57,14 +61,35 @@ def parse_args():
     p.add_argument("--person-class", type=int, default=PERSON_CLASS, help="Indice classe person")
     p.add_argument("--danger-w-frac", type=float, default=DANGER_W_FRAC, help="Larghezza danger zone")
     p.add_argument("--danger-h-frac", type=float, default=DANGER_H_FRAC, help="Altezza danger zone")
+
+    p.add_argument(
+        "--warning-margin-frac",
+        type=float,
+        default=WARNING_MARGIN_FRAC,
+        help="Estensione extra della warning zone rispetto alla danger zone",
+    )
+    p.add_argument(
+        "--feet-mask-frac",
+        type=float,
+        default=FEET_MASK_FRAC,
+        help="Percentuale inferiore della mask usata come piedi",
+    )
+
     p.add_argument("--display", action="store_true", help="Mostra preview live")
     p.add_argument("--debug-outputs", action="store_true", help="Stampa output solo al primo frame")
-    p.add_argument("--person-score-thr", type=float, default=0.70,
-                help="soglia reale per la classe person")
-    p.add_argument("--topk-per-scale", type=int, default=120,
-                help="max candidate per scala prima della NMS")
+    p.add_argument(
+        "--person-score-thr",
+        type=float,
+        default=0.70,
+        help="soglia reale per la classe person",
+    )
+    p.add_argument(
+        "--topk-per-scale",
+        type=int,
+        default=120,
+        help="max candidate per scala prima della NMS",
+    )
     return p.parse_args()
-
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
@@ -590,29 +615,55 @@ def decode_yolov8_seg_person_only(
 
     return filter_person_instances(detections, meta["orig_shape"])
 
-def draw_detections(frame: np.ndarray, detections: List[Dict], zone):
-    alert_active = False
+def draw_detections(frame: np.ndarray, detections: List[Dict], warning_zone, danger_zone, feet_frac=0.20):
+    warning_active = False
+    danger_active = False
 
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         score = det["score"]
         mask = det["mask"]
 
-        in_danger = mask_intersects_zone(mask, zone) if mask is not None else boxes_intersect((x1, y1, x2, y2), zone)
-        det["in_danger"] = in_danger
-        alert_active = alert_active or in_danger
+        in_danger = False
+        in_warning = False
 
-        color = (0, 0, 255) if in_danger else (0, 255, 0)
+        if mask is not None:
+            in_danger = feet_mask_intersects_zone(mask, danger_zone, feet_frac)
+            in_warning = feet_mask_intersects_zone(mask, warning_zone, feet_frac)
+        else:
+            in_danger = boxes_intersect((x1, y1, x2, y2), danger_zone)
+            in_warning = boxes_intersect((x1, y1, x2, y2), warning_zone)
+
+        in_warning_only = in_warning and not in_danger
+
+        det["in_danger"] = in_danger
+        det["in_warning"] = in_warning_only
+
+        danger_active = danger_active or in_danger
+        warning_active = warning_active or in_warning_only
+
+        if in_danger:
+            color = (0, 0, 255)      # rosso
+            tag = " [DANGER]"
+            alpha = 0.45
+        elif in_warning_only:
+            color = (0, 255, 255)    # giallo
+            tag = " [WARNING]"
+            alpha = 0.30
+        else:
+            color = (0, 255, 0)      # verde
+            tag = ""
+            alpha = 0.18
 
         if mask is not None:
             overlay = frame.copy()
             overlay[mask] = color
-            alpha = 0.45 if in_danger else 0.18
             cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
 
             contours, _ = cv2.findContours(
                 mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
+
             if in_danger:
                 cv2.drawContours(frame, contours, -1, (255, 255, 255), 4)
                 cv2.drawContours(frame, contours, -1, color, 2)
@@ -621,7 +672,7 @@ def draw_detections(frame: np.ndarray, detections: List[Dict], zone):
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label = f"person {score:.2f}" + (" [DANGER]" if in_danger else "")
+        label = f"person {score:.2f}{tag}"
         cv2.putText(
             frame,
             label,
@@ -633,8 +684,65 @@ def draw_detections(frame: np.ndarray, detections: List[Dict], zone):
             cv2.LINE_AA,
         )
 
-    return alert_active
+    return warning_active, danger_active
 
+def draw_zones(frame, warning_zone, danger_zone, warning_active, danger_active):
+    wx1, wy1, wx2, wy2 = warning_zone
+    dx1, dy1, dx2, dy2 = danger_zone
+
+    overlay = frame.copy()
+
+    cv2.rectangle(overlay, (wx1, wy1), (wx2, wy2), (0, 255, 255), -1)  # giallo
+    cv2.rectangle(overlay, (dx1, dy1), (dx2, dy2), (0, 0, 255), -1)    # rosso
+
+    cv2.addWeighted(overlay, 0.16, frame, 0.84, 0, dst=frame)
+
+    cv2.rectangle(frame, (wx1, wy1), (wx2, wy2), (0, 255, 255), 2)
+    cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 0, 255), 2)
+
+    cv2.putText(
+        frame, "WARNING ZONE",
+        (wx1 + 8, max(24, wy1 + 24)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA
+    )
+
+    cv2.putText(
+        frame, "DANGER ZONE",
+        (dx1 + 8, max(50, dy1 + 48)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 255), 2, cv2.LINE_AA
+    )
+
+def extract_feet_mask(mask: np.ndarray, feet_frac: float = 0.20) -> np.ndarray:
+    if mask is None:
+        return np.zeros((0, 0), dtype=bool)
+
+    if mask.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    y_top = ys.min()
+    y_bottom = ys.max()
+    h = max(1, y_bottom - y_top + 1)
+
+    feet_h = max(1, int(round(h * feet_frac)))
+    feet_y1 = max(y_top, y_bottom - feet_h + 1)
+
+    feet_mask = np.zeros_like(mask, dtype=bool)
+    feet_mask[feet_y1:y_bottom + 1, :] = mask[feet_y1:y_bottom + 1, :]
+    return feet_mask
+
+
+def feet_mask_intersects_zone(mask: np.ndarray, zone, feet_frac: float = 0.20) -> bool:
+    if mask is None or mask.size == 0:
+        return False
+
+    feet_mask = extract_feet_mask(mask, feet_frac)
+    x1, y1, x2, y2 = zone
+    roi = feet_mask[y1:y2, x1:x2]
+    return roi.size > 0 and bool(np.any(roi))
 
 def main():
     args = parse_args()
@@ -669,7 +777,21 @@ def main():
         if not writer.isOpened():
             sys.exit(f"[!] Impossibile aprire il writer: {args.output}")
 
-        zone = compute_danger_zone(orig_w, orig_h, args.danger_w_frac, args.danger_h_frac)
+        danger_zone = compute_danger_zone(
+            orig_w,
+            orig_h,
+            args.danger_w_frac,
+            args.danger_h_frac,
+        )
+
+        warning_w_frac = min(1.0, args.danger_w_frac + args.warning_margin_frac)
+        warning_h_frac = min(1.0, args.danger_h_frac + args.warning_margin_frac)
+        warning_zone = compute_danger_zone(
+            orig_w,
+            orig_h,
+            warning_w_frac,
+            warning_h_frac,
+        )
 
         frame_idx = 0
         t0 = time.time()
@@ -694,6 +816,7 @@ def main():
                     printed_debug = True
 
                 display = frame.copy()
+
                 try:
                     detections = decode_yolov8_seg_person_only(
                         parsed=parsed,
@@ -705,27 +828,53 @@ def main():
                         topk_per_scale=args.topk_per_scale,
                     )
                 except Exception as e:
-                    draw_danger_zone(display, zone, False)
+                    draw_zones(
+                        display,
+                        warning_zone,
+                        danger_zone,
+                        warning_active=False,
+                        danger_active=False,
+                    )
                     draw_info(display, [
                         f"frame {frame_idx}/{total_frames}",
                         "errore decoder segmentation",
                         str(e)[:90],
                     ])
+
                     writer.write(display)
+
                     if args.display:
                         cv2.imshow("Hailo YOLOv8 Seg", display)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
+
                     frame_idx += 1
                     continue
 
-                alert_active = False
-                if detections:
-                    alert_active = draw_detections(display, detections, zone)
+                warning_active = False
+                danger_active = False
 
-                draw_danger_zone(display, zone, alert_active)
-                if alert_active:
-                    draw_alert_banner(display)
+                if detections:
+                    warning_active, danger_active = draw_detections(
+                        display,
+                        detections,
+                        warning_zone,
+                        danger_zone,
+                        feet_frac=args.feet_mask_frac,
+                    )
+
+                draw_zones(
+                    display,
+                    warning_zone,
+                    danger_zone,
+                    warning_active,
+                    danger_active,
+                )
+
+                if danger_active:
+                    draw_alert_banner(display, "!! ALERT: PERSONA IN DANGER ZONE !!")
+                elif warning_active:
+                    draw_alert_banner(display, "!! ATTENZIONE: PERSONA IN WARNING ZONE !!")
 
                 avg_ms = 1000.0 * np.mean(times[-30:]) if times else 0.0
                 draw_info(display, [
@@ -751,7 +900,6 @@ def main():
         fps_e2e = frame_idx / elapsed if elapsed > 0 else 0.0
         print(f"[i] Done. Frame processati: {frame_idx}, fps end-to-end: {fps_e2e:.2f}")
         print(f"[i] Output salvato in: {args.output}")
-
 
 if __name__ == "__main__":
     main()
