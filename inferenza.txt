@@ -1,0 +1,1 @@
+python3 inferenza_hailo_dual.py     --danger-dist 2.0     --warning-dist 5.0     --video ./video_inferenza/video_1.mp4     --display
